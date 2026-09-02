@@ -46,7 +46,8 @@
     Used for the classic API path.
 
 .PARAMETER AuthMode
-    Auto    (default) API key first, fall back to username/password if both are supplied
+    Auto    (default) API key first, fall back to username/password if both are
+            supplied - including when the key itself is rejected with 401/403
     ApiKey  force the Integration API
     Classic force the classic API
     Cloud   Site Manager connector, requires -ConsoleId and a Site Manager -ApiKey
@@ -110,7 +111,11 @@
     but the unit is not documented unambiguously, and the classic API returns bytes/s.
     Verify against a known load before you set limits on those channels.
 
-    Version 2.0
+    Device counting: every device is counted in exactly one category. A UDM/UXG
+    reports switching (and sometimes accessPoint) alongside gateway, but it stays a
+    gateway, so Total = gateways + switches + APs + uncategorised.
+
+    Version 2.1
 #>
 
 [CmdletBinding()]
@@ -338,6 +343,7 @@ function Get-CacheFilePath {
     $safe = ($h -replace '[^A-Za-z0-9\.\-]', '_')
     $dir = $env:TEMP
     if (-not $dir) { $dir = $env:TMP }
+    if (-not $dir) { try { $dir = [System.IO.Path]::GetTempPath() } catch { } }
     if (-not $dir) { $dir = '.' }
     return (Join-Path $dir ("prtg_unifi_base_{0}_{1}.txt" -f $safe, $Port))
 }
@@ -345,8 +351,11 @@ function Get-CacheFilePath {
 function Test-IntegrationBaseUri {
     param([string]$Uri)
     try {
-        $null = Invoke-Rest -Uri ($Uri + '/v1/info') -Timeout $ProbeTimeoutSec `
+        $resp = Invoke-Rest -Uri ($Uri + '/v1/info') -Timeout $ProbeTimeoutSec `
                             -Headers @{ 'X-API-KEY' = $ApiKey; 'Accept' = 'application/json' }
+        # The legacy application answers unknown paths with its SPA index page.
+        # That is a string, not the JSON object the Integration API returns.
+        if ($null -eq $resp -or $resp -is [string]) { return 'NO' }
         return 'OK'
     }
     catch {
@@ -356,12 +365,23 @@ function Test-IntegrationBaseUri {
     }
 }
 
+function Test-ClassicFallbackAvailable {
+    # -AuthMode ApiKey rules the classic path out on purpose; otherwise it needs
+    # a complete local admin login.
+    return (($AuthMode -ne 'ApiKey') -and $Username -and $Password)
+}
+
 function Find-IntegrationBaseUri {
     if ($BaseUrl) {
         $u = $BaseUrl.TrimEnd('/')
         $r = Test-IntegrationBaseUri -Uri $u
         if ($r -eq 'OK')   { return $u }
-        if ($r -eq 'AUTH') { Write-PrtgError "The API key was rejected by $u (HTTP 401/403). Check the key and that it was created on this console." }
+        if ($r -eq 'AUTH') {
+            $script:KeyRejected = $true
+            if (-not (Test-ClassicFallbackAvailable)) {
+                Write-PrtgError "The API key was rejected by $u (HTTP 401/403). Check the key and that it was created on this console."
+            }
+        }
         return $null
     }
 
@@ -389,8 +409,11 @@ function Find-IntegrationBaseUri {
     }
 
     if ($sawAuth) {
-        Write-PrtgError ("A UniFi endpoint answered but rejected the API key (HTTP 401/403) on {0}. " -f (Get-NormalizedHost) +
-                         "Verify the key was generated in this Network application under Settings > Control Plane > Integrations.")
+        $script:KeyRejected = $true
+        if (-not (Test-ClassicFallbackAvailable)) {
+            Write-PrtgError ("A UniFi endpoint answered but rejected the API key (HTTP 401/403) on {0}. " -f (Get-NormalizedHost) +
+                             "Verify the key was generated in this Network application under Settings > Control Plane > Integrations.")
+        }
     }
     return $null
 }
@@ -607,8 +630,8 @@ function Get-DevicesViaClassic {
         $cpu = $null; $mem = $null
         if ($sys) {
             $c = Get-Prop $sys 'cpu'; $m = Get-Prop $sys 'mem'
-            if ($c -ne $null -and "$c" -ne '') { try { $cpu = [double]$c } catch { } }
-            if ($m -ne $null -and "$m" -ne '') { try { $mem = [double]$m } catch { } }
+            if ($null -ne $c -and "$c" -ne '') { try { $cpu = [double]$c } catch { } }
+            if ($null -ne $m -and "$m" -ne '') { try { $mem = [double]$m } catch { } }
         }
 
         $plist = New-Object System.Collections.Generic.List[object]
@@ -651,6 +674,7 @@ function Get-DevicesViaClassic {
 # ===========================================================================
 
 $script:ApiErrors        = 0
+$script:KeyRejected      = $false
 $script:BaseUri          = $null
 $script:ResolvedSiteName = $SiteName
 $script:PlatformLabel    = 'unknown'
@@ -679,6 +703,8 @@ else {
         }
         if (Connect-ClassicApi) {
             # ok, classic fallback
+        } elseif ($script:KeyRejected) {
+            Write-PrtgError ("The API key was rejected on {0} (HTTP 401/403) and the classic API login did not succeed either. Check the key under Settings > Control Plane > Integrations and the local admin credentials." -f (Get-NormalizedHost))
         } elseif ($Username -or $Password) {
             Write-PrtgError ("Neither the Integration API nor the classic API could be reached on {0}. Check host, ports (443/11443/8443), firewall and credentials." -f (Get-NormalizedHost))
         } else {
@@ -742,10 +768,13 @@ foreach ($d in $devices) {
     elseif ($d.State -eq 'OFFLINE') { $offline++; [void]$offlineNames.Add($d.Name) }
     else                            { $transit++ }
 
-    # A gateway with built-in switch ports (UDM/UXG) counts as a gateway, not a switch.
+    # Every device lands in exactly one category. A UDM/UXG reports switching and
+    # sometimes accessPoint as well, but it is one gateway - counting it again as a
+    # switch or an AP would inflate the totals and would not match the classic API,
+    # where the device type is already exclusive.
     if     ($d.IsGw) { $gwTotal++; if ($isOnline) { $gwOnline++ } }
     elseif ($d.IsSw) { $swTotal++; if ($isOnline) { $swOnline++ } }
-    if     ($d.IsAp) { $apTotal++; if ($isOnline) { $apOnline++ } }
+    elseif ($d.IsAp) { $apTotal++; if ($isOnline) { $apOnline++ } }
 
     if ($null -ne $d.CpuPct) { [void]$cpuValues.Add([double]$d.CpuPct) }
     if ($null -ne $d.MemPct) { [void]$memValues.Add([double]$d.MemPct) }
@@ -836,6 +865,7 @@ if ($script:ResolvedSiteName) { [void]$parts.Add("Site '$($script:ResolvedSiteNa
 [void]$parts.Add("$apOnline/$apTotal APs")
 if ($IncludeDetails -and $fwUpdates -gt 0) { [void]$parts.Add("$fwUpdates firmware update(s)") }
 [void]$parts.Add($script:PlatformLabel)
+if ($script:KeyRejected) { [void]$parts.Add('API key rejected - using the classic API') }
 
 $message = $parts -join ' | '
 
