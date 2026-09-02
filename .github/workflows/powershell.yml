@@ -34,7 +34,7 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning -Settings ./PSScriptAnalyzerSettings.psd1
           if ($results) { $results | Format-Table -AutoSize RuleName, Severity, Line, ScriptName, Message }
           $errors = @($results | Where-Object Severity -eq 'Error')
           if ($errors.Count -gt 0) { exit 1 }
