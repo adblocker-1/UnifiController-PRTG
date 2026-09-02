@@ -1,0 +1,11 @@
+# Cache der Base-URL-Erkennung (landet normalerweise in %TEMP%,
+# ohne %TEMP% aber im aktuellen Verzeichnis)
+prtg_unifi_base_*.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
