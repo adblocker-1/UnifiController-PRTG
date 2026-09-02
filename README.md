@@ -184,7 +184,7 @@ Sensoren darunter geerbt. Ein Key-Wechsel ist dann eine Änderung statt hundert.
 | `-ApiKey` | string | – | API-Key der Network Application oder Site-Manager-Key bei `-AuthMode Cloud`. |
 | `-Username` | string | – | Lokaler Admin für den klassischen Pfad. |
 | `-Password` | string | – | Passwort dazu. |
-| `-AuthMode` | `Auto`/`ApiKey`/`Classic`/`Cloud` | `Auto` | `Auto`: erst API-Key, sonst Benutzer/Passwort. `Cloud`: Site-Manager-Connector. |
+| `-AuthMode` | `Auto`/`ApiKey`/`Classic`/`Cloud` | `Auto` | `Auto`: erst API-Key, sonst Benutzer/Passwort – auch dann, wenn der Key mit 401/403 abgelehnt wird. `ApiKey`/`Classic`: einen Pfad erzwingen. `Cloud`: Site-Manager-Connector. |
 | `-ConsoleId` | string | – | Console ID, Pflicht bei `-AuthMode Cloud`. |
 | `-SiteName` | string | erste Site | Integration API: der Anzeigename. Klassische API: Kurzname (`default`) **oder** Beschreibung. |
 | `-SiteId` | string | – | Site-UUID (nur Integration API), spart den Site-Lookup-Aufruf. |
@@ -238,8 +238,11 @@ Hinweise zur Zählweise:
 
 - „Offline" bei Switches und APs meint **nicht online**, also inklusive
   Adoption, Provisioning und ausbleibendem Heartbeat.
-- Ein Gateway mit eingebauten Switch-Ports (UDM, UXG) zählt als Gateway,
-  nicht zusätzlich als Switch.
+- Jedes Gerät zählt in **genau einer** Kategorie. Ein UDM/UXG meldet neben
+  `gateway` auch `switching` und teils `accessPoint`, bleibt aber ein Gateway –
+  es taucht also nicht zusätzlich bei Switches oder APs auf. Damit gilt
+  `Devices Total = Gateways + Switches + Access Points + nicht zugeordnete`,
+  und beide API-Pfade liefern dieselben Zahlen.
 - `API Errors` zählt fehlgeschlagene Detail-/Statistikaufrufe einzelner Geräte.
   Der Sensor bleibt dabei grün-fähig und liefert die restlichen Werte weiter.
 
@@ -286,10 +289,18 @@ beim nächsten Lauf zuerst probiert – dadurch kommt ein normaler Scan mit eine
 einzigen Erkennungsaufruf aus. `-NoCache` schaltet das ab, `-BaseUrl` oder
 `-Port` grenzen die Kandidatenliste ein bzw. überspringen sie.
 
-Findet sich kein Integration-Endpunkt und sind `-Username`/`-Password` gesetzt,
-wechselt `Auto` auf den klassischen Pfad: Login gegen `8443/api/login`,
-`443/api/auth/login` und `11443/api/auth/login`, danach ein einziger Aufruf
-`/api/s/<site>/stat/device` für alle Daten.
+Antwortet auf keinem Kandidaten eine Integration API – oder wird der Key dort mit
+401/403 abgelehnt – und sind `-Username`/`-Password` gesetzt, wechselt `Auto` auf
+den klassischen Pfad: Login gegen `8443/api/login`, `443/api/auth/login` und
+`11443/api/auth/login`, danach ein einziger Aufruf `/api/s/<site>/stat/device`
+für alle Daten. Ein abgelehnter Key geht dabei nicht verloren: die Sensormeldung
+bekommt den Zusatz `API key rejected - using the classic API`, damit ein
+vertippter oder abgelaufener Key nicht unbemerkt in den langsameren Pfad rutscht.
+
+Eine Antwort wird nur dann als Integration API gewertet, wenn sie ein JSON-Objekt
+ist. Die Legacy-Anwendung liefert auf unbekannte Pfade ihre Weboberfläche mit
+HTTP 200 aus – die würde sonst als gültiger Endpunkt durchgehen und später zu
+irreführenden Fehlern führen.
 
 ## Fehlerbehebung
 
@@ -299,7 +310,9 @@ steht im Sensor unter **Last Message**.
 | Meldung | Ursache und Lösung |
 | --- | --- |
 | `No Integration API endpoint answered on <host> (tried 443, 11443, 8443)` | Falscher Host, Firewall, oder es ist die alte self-hosted Anwendung ohne API-Key-Unterstützung. Dann `-Username`/`-Password` verwenden, oder `-Port`/`-BaseUrl` explizit setzen. |
-| `A UniFi endpoint answered but rejected the API key (HTTP 401/403)` | Key falsch, abgelaufen oder auf einer anderen Konsole erzeugt. Neuen Key unter **Settings → Control Plane → Integrations** anlegen. |
+| `A UniFi endpoint answered but rejected the API key (HTTP 401/403)` | Key falsch, abgelaufen oder auf einer anderen Konsole erzeugt. Neuen Key unter **Settings → Control Plane → Integrations** anlegen. Erscheint nur, wenn kein `-Username`/`-Password` als Rückfallebene gesetzt ist. |
+| `The API key was rejected ... and the classic API login did not succeed either` | Beide Wege scheitern. Key **und** Zugangsdaten prüfen. |
+| Sensormeldung enthält `API key rejected - using the classic API` | Der Sensor läuft, aber über den langsameren klassischen Pfad, weil der Key abgelehnt wurde. Key erneuern, sonst bleibt es dabei. |
 | `Login rejected by <url> (HTTP 401)` | Falsche Zugangsdaten, MFA aktiv oder das Konto ist kein „Local Access"-Admin. |
 | `Could not log in to any classic API endpoint` | Kein erreichbarer Port. Host, Port und Firewall prüfen, ggf. `-Port` setzen. |
 | `Site '<name>' not found. Available: …` | Site-Namen aus der Liste in der Meldung übernehmen. Integration API erwartet den Anzeigenamen, die klassische API Kurznamen oder Beschreibung. |
@@ -324,11 +337,10 @@ cd 'C:\Program Files (x86)\PRTG Network Monitor\Custom Sensors\EXEXML'
   aber nicht eindeutig dokumentiert; die klassische API liefert Byte/s. Die
   Kanäle sind auf `B/s` gesetzt. Vor dem Setzen von Limits gegen eine bekannte
   Last gegenprüfen.
-- **`-AuthMode Auto` mit ungültigem API-Key:** Antwortet ein Endpunkt mit
-  401/403, bricht das Skript mit einem Key-Fehler ab und probiert
-  `-Username`/`-Password` nicht mehr – die Meldung über den abgelehnten Key ist in
-  der Praxis hilfreicher als ein stiller Fallback. Wer trotzdem den klassischen
-  Pfad braucht, setzt `-AuthMode Classic`.
+- **`-AuthMode ApiKey` hat keine Rückfallebene.** Das ist der Sinn des Modus.
+  Ein abgelehnter Key beendet den Sensor dort mit einem Fehler, statt still auf
+  den klassischen Pfad zu wechseln. In `Auto` wird dagegen zurückgefallen,
+  sofern `-Username` und `-Password` gesetzt sind.
 - **`-NoStatistics` im klassischen Pfad** blendet die Kanäle aus, spart aber keine
   Aufrufe – dort kommen alle Daten ohnehin aus einer einzigen Antwort.
 - **Keine API-Keys auf der Legacy-Anwendung (8443).** Dort führt nur der
